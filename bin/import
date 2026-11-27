@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# import — turn a directory of source material into data/knowledge/ notes, proposed as a PR.
+#
+#   import <source-dir> <label>     e.g. import data/runs/import-github github
+#
+# The agent reads the source files, edits data/knowledge/ on branch import/<label>-<date> of the
+# data repo, and the result is opened there as a pull request for review. Source dirs normally live
+# under data/runs/ (git-ignored), so raw material never enters a repo — only the curated notes do.
+set -euo pipefail
+
+. "$(dirname "$0")/brain-env.sh"
+require_data
+[ $# -eq 2 ] || { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+SRC="$(cd "$1" && pwd)"; LABEL="$2"
+export HINDSIGHT_DISABLE_HOOKS=1
+export PATH="$REPO/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+
+cd "$DATA"   # git and gh below act on the data repo
+[ -z "$(git status --porcelain)" ] || { echo "import: working tree not clean" >&2; exit 1; }
+git checkout -q main && git pull -q --rebase
+
+today="$(date +%Y-%m-%d)"
+branch="import/$LABEL-$today"
+git checkout -q -B "$branch"
+mkdir -p "$DATA/runs"
+log="$DATA/runs/import-$LABEL-$today.summary.md"
+
+echo "import: agent reading $SRC …" >&2
+engine_before="$(git -C "$REPO" status --porcelain)"
+(cd "$REPO" && claude -p "$(render "$REPO/prompts/import.md"; printf '\nToday is %s.\nSource directory: %s\n' "$today" "$SRC")" \
+  --add-dir "$SRC" --allowedTools Read Grep Glob Edit Write \
+  --permission-mode acceptEdits --no-session-persistence < /dev/null > "$log")
+
+if [ "$(git -C "$REPO" status --porcelain)" != "$engine_before" ]; then
+  echo "import: agent changed the engine repo; review by hand (git -C $REPO status)" >&2
+  git checkout -q -- . && git clean -fdq -- knowledge && git checkout -q main; exit 1
+fi
+if git status --porcelain | grep -qv ' knowledge/'; then
+  echo "import: agent changed files outside data/knowledge/; discarding" >&2
+  git status --porcelain >&2
+  git checkout -q -- . && git clean -fdq -- knowledge && git checkout -q main; exit 1
+fi
+if [ -z "$(git status --porcelain)" ]; then
+  echo "import: no changes"; git checkout -q main; git branch -q -D "$branch"; exit 0
+fi
+
+git add knowledge
+git commit -q -m "knowledge: import from $LABEL ($today)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git push -q -f -u origin "$branch" 2>/dev/null
+gh pr view "$branch" >/dev/null 2>&1 || gh pr create --base main --head "$branch" \
+  --title "Import: $LABEL ($today)" \
+  --body "$(cat "$log"; printf '\n\n---\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n')" >/dev/null
+git checkout -q main
+echo "import: $(git diff --stat main "$branch" | tail -1)"
+echo "import: PR $(gh pr view "$branch" --json url -q .url)"

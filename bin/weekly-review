@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# weekly-review — check the brain system for improvements and report them as a GitHub issue.
+#
+#   weekly-review              # normal run (used by brain-weekly-review.timer)
+#   weekly-review --dry-run    # gather host facts and print them; no agent, no issue
+#   weekly-review --no-issue   # run the agent and print the report; no issue
+#
+# Steps: gather host facts with plain shell (pinned and observed models, installed vs. latest
+# versions, memory and service health, auth warnings) → Claude, with web access, answers the three
+# questions in prompts/weekly-review.md against them and last week's report → open an issue
+# "Weekly review: <date>" and close last week's, or comment "no changes" on it. Issues go to the
+# data repo (GH_REPO), since host facts and findings are not for the public engine repo.
+# Read-only for both repos: it never edits files, branches or commits.
+set -euo pipefail
+
+. "$(dirname "$0")/brain-env.sh"
+STATE_DIR="$HOME/.local/state/brain"
+LAST_REPORT="$STATE_DIR/weekly-review-last.md"
+MODE=run
+case "${1:-}" in --dry-run) MODE=dry ;; --no-issue) MODE=noissue ;; "") ;; *) sed -n 2,12p "$0"; exit 2 ;; esac
+export HINDSIGHT_DISABLE_HOOKS=1   # don't retain this job's own session
+export PATH="$REPO/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+
+mkdir -p "$STATE_DIR" "$DATA/runs"
+cd "$REPO"
+today="$(date +%Y-%m-%d)"
+run="$DATA/runs/weekly-review-$today"
+mkdir -p "$run"
+
+ISSUE_FAILED="Weekly review failed"
+if [ $MODE = run ]; then
+  log="$run/run.log"
+  exec 3>&1 4>&2   # keep the original stdout/stderr (the journal) for the exit trap
+  exec > >(tee -a "$log") 2>&1
+  tee_pid=$!
+  on_exit() {
+    local rc=$? body num
+    # Detach from tee and wait for it, so the log is complete before it is read or the job exits.
+    exec >&3 2>&4
+    wait "$tee_pid" 2>/dev/null || true
+    [ $rc -eq 0 ] && return
+    body="$(printf 'Run on %s exited with status %s.\n\n```\n%s\n```\n' "$today" "$rc" "$(tail -n 60 "$log")")"
+    num="$(gh issue list --state open --json number,title \
+      -q ".[] | select(.title == \"$ISSUE_FAILED\") | .number" 2>/dev/null | head -1)"
+    if [ -n "$num" ]; then gh issue comment "$num" --body "$body" >/dev/null
+    else gh issue create --title "$ISSUE_FAILED" --label bug --body "$body" >/dev/null
+    fi || echo "weekly-review: could not report the failure to GitHub" >&2
+  }
+  trap on_exit EXIT
+fi
+
+# ---------- host facts (plain shell, no model calls) ----------
+section() { printf '\n### %s\n\n```\n' "$1"; }
+endsection() { printf '```\n'; }
+
+# Models seen in the last 7 days of Claude Code and Codex session logs, by count.
+observed_models() {
+  find "$HOME/.claude/projects" -name '*.jsonl' -mtime -7 -print0 2>/dev/null \
+    | xargs -0 -r grep -ohE '"model":"[^"]+"' | sort | uniq -c | sort -rn | sed 's/^/claude: /'
+  find "$HOME/.codex/sessions" -name '*.jsonl' -mtime -7 -print0 2>/dev/null \
+    | xargs -0 -r grep -ohE '"model": ?"[^"]+"' | sort | uniq -c | sort -rn | sed 's/^/codex: /'
+}
+
+latest_npm() { timeout 30 npm view "$1" version 2>/dev/null || echo unknown; }
+latest_pypi() {
+  curl -sf -m 20 "https://pypi.org/pypi/$1/json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || echo unknown
+}
+hindsight_version() {
+  "$HOME/hindsight/.venv/bin/python" -c 'import importlib.metadata as m; print(m.version("hindsight-api-slim"))' 2>/dev/null || echo unknown
+}
+
+service_health() {
+  local u
+  for u in hindsight brain-signal brain-signal-bridge; do
+    systemctl show "$u" -p ActiveState -p ActiveEnterTimestamp -p NRestarts -p MemoryCurrent \
+      -p MemoryPeak -p MemorySwapCurrent -p MemorySwapPeak -p MemoryHigh -p MemoryMax -p MemorySwapMax \
+      | tr '\n' ' ' | sed "s/^/$u: /"; echo
+  done
+}
+
+facts() {
+  printf '## Host facts (%s)\n' "$(date -u +%Y-%m-%dT%H:%MZ)"
+  # First, so the session file it writes is counted under "Models seen" below.
+  section "Codex login keepalive"
+  # Codex (ChatGPT login) renews its tokens only when it runs, and the council is its only user, so
+  # a long idle spell can let the login lapse unnoticed. One tiny call a week keeps it renewed.
+  if [ "$MODE" = dry ]; then
+    echo "skipped in --dry-run"
+  # Not --ephemeral (unlike the council): its one session file a week is how observed_models
+  # sees which model the unpinned Codex runs.
+  elif out="$(cd "$REPO" && timeout 120 codex exec "Reply with exactly: codex ok" -s read-only \
+        --skip-git-repo-check --color never < /dev/null 2>&1)" && grep -q 'codex ok' <<<"$out"; then
+    echo "codex keepalive: ok"
+  else
+    echo "codex keepalive: FAILED, so the council's Codex member is down; fix with 'codex login' over SSH"
+    tail -5 <<<"$out"
+  fi
+  python3 -c 'import json,os; print("codex last token refresh:", json.load(open(os.path.expanduser("~/.codex/auth.json"))).get("last_refresh"))' 2>/dev/null || true
+  endsection
+
+  section "Pinned models and model settings"
+  grep -E '^HINDSIGHT_API_(LLM|EMBEDDINGS|RERANKER)' "$HOME/hindsight/hindsight.env" 2>/dev/null | sed 's/^/hindsight.env: /' || true
+  python3 - <<'EOF' 2>/dev/null || true
+import json, os
+s = json.load(open(os.path.expanduser("~/.claude/settings.json")))
+print("claude settings.json: model =", s.get("model", "(unset: CLI default)"), "; effortLevel =", s.get("effortLevel", "(unset)"))
+EOF
+  grep -E '^(model|model_reasoning_effort|profile) *=' "$HOME/.codex/config.toml" 2>/dev/null | sed 's/^/codex config.toml: /' \
+    || echo "codex config.toml: model unset (CLI default)"
+  grep -rnE -- '(--model|--effort|-m) ' bin/council bin/nightly bin/import bin/signal-bridge 2>/dev/null \
+    | grep -E 'claude|codex' | sed 's/^/flag in /' || echo "no --model/--effort flags in bin/ scripts"
+  endsection
+
+  section "Models seen in sessions, last 7 days (count model)"
+  observed_models || true
+  endsection
+
+  section "Installed vs. latest versions"
+  printf 'claude-code: installed %s, latest %s\n' "$(claude --version 2>/dev/null | awk '{print $1}')" "$(latest_npm @anthropic-ai/claude-code)"
+  printf 'codex: installed %s, latest %s\n' "$(codex --version 2>/dev/null | awk '{print $2}')" "$(latest_npm @openai/codex)"
+  printf 'hindsight-api-slim: installed %s, latest %s\n' "$(hindsight_version)" "$(latest_pypi hindsight-api-slim)"
+  printf 'hindsight coding-agents plugin: %s\n' "$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.hindsight/coding-agents/package.json"))).get("version","?"))' 2>/dev/null || echo unknown)"
+  printf 'signal-cli: installed %s (updates are tracked by the nightly job)\n' "$(signal-cli --version 2>/dev/null | awk '{print $2}')"
+  endsection
+
+  section "Host memory and services"
+  free -m
+  service_health
+  printf 'uptime: %s\n' "$(uptime)"
+  printf 'OOM kills in the last 7 days:\n'
+  journalctl --since '-7d' --no-pager -q -k 2>/dev/null | grep -iE 'out of memory|oom-kill' | tail -10 || true
+  sudo -n journalctl --since '-7d' --no-pager -q -u hindsight -u brain-signal-bridge 2>/dev/null \
+    | grep -iE 'oom-kill|killed' | tail -10 || true
+  endsection
+
+  section "Scheduled jobs, last 7 days"
+  ls -1 "$DATA/runs/" 2>/dev/null | grep -E "^nightly-.*\.log$" | tail -7 | while read -r f; do
+    printf '%s: %s\n' "$f" "$(grep -E '^nightly: ' "$DATA/runs/$f" | tail -1)"
+  done
+  printf 'claude interactive sign-in (Signal bridge, terminal): %s\n' "$(env -u CLAUDE_CODE_OAUTH_TOKEN claude auth status 2>/dev/null | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s.get("authMethod"), "expires", s.get("loginExpiresAt") or "unknown")' 2>/dev/null || echo unknown)"
+  if [ -f "$HOME/.config/brain/claude.env" ]; then
+    printf 'claude setup-token (headless jobs, Hindsight): written %s, expires ~%s\n' \
+      "$(date -d "@$(stat -c %Y "$HOME/.config/brain/claude.env")" +%F)" \
+      "$(date -d "@$(( $(stat -c %Y "$HOME/.config/brain/claude.env") + 365*86400 ))" +%F)"
+  else
+    printf 'claude setup-token: missing (~/.config/brain/claude.env)\n'
+  fi
+  printf 'auth warnings in nightly logs, last 7 days: '
+  { find "$DATA/runs" -maxdepth 1 -name 'nightly-*.log' -mtime -7 -exec grep -hE 'sign-in can end|setup-token|auth login|401|Unauthorized' {} + 2>/dev/null | sort -u | tail -3; } || true
+  printf '\nopen issues: '
+  gh issue list --state open --json title -q '[.[].title] | join("; ")' 2>/dev/null || echo unknown
+  endsection
+
+  section "Hindsight session-hook settings"
+  grep -E '"autoInject"|"injectTimeoutMs"' "$HOME/.hindsight/coding-agents/settings.json" "$REPO/infra/hindsight/coding-agent.json" 2>/dev/null || true
+  endsection
+}
+
+facts > "$run/facts.md"
+if [ $MODE = dry ]; then cat "$run/facts.md"; exit 0; fi
+
+# ---------- review (one headless Claude run with web access) ----------
+{
+  render prompts/weekly-review.md
+  printf '\nToday is %s.\n\n' "$today"
+  cat "$run/facts.md"
+  printf '\n## Last week'"'"'s report\n\n'
+  if [ -s "$LAST_REPORT" ]; then cat "$LAST_REPORT"; else echo "(none: this is the first run)"; fi
+} > "$run/prompt.md"
+
+echo "weekly-review: asking claude (run dir: ${run#$REPO/})"
+timeout 40m claude -p "$(cat "$run/prompt.md")" \
+  --allowedTools Read Grep Glob WebSearch WebFetch \
+  --effort high --no-session-persistence < /dev/null > "$run/report.md"
+
+[ -s "$run/report.md" ] || { echo "weekly-review: empty report" >&2; exit 1; }
+if [ $MODE = noissue ]; then cat "$run/report.md"; exit 0; fi
+
+# ---------- publish ----------
+prev="$(gh issue list --state open --label weekly-review --json number -q '.[0].number' 2>/dev/null || true)"
+if head -1 "$run/report.md" | grep -q '^NO_CHANGES'; then
+  msg="$(printf '**%s:** no changes. %s' "$today" "$(sed -n 2p "$run/report.md")")"
+  if [ -n "$prev" ]; then gh issue comment "$prev" --body "$msg" >/dev/null; fi
+  echo "weekly-review: no changes"
+else
+  gh label create weekly-review --color 0e8a16 --description "Weekly system review" >/dev/null 2>&1 || true
+  url="$(gh issue create --title "Weekly review: $today" --label weekly-review \
+    --body "$(cat "$run/report.md"; printf '\n\n---\nHost facts the review was based on: `data/runs/weekly-review-%s/facts.md` on the host.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' "$today")")"
+  if [ -n "$prev" ]; then
+    gh issue close "$prev" --comment "Superseded by $url" >/dev/null || true
+  fi
+  cp "$run/report.md" "$LAST_REPORT"
+  echo "weekly-review: opened $url"
+fi

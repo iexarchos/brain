@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""prep-claude-export — turn an unzipped claude.ai data export into import-ready text.
+
+  prep-claude-export <raw-dir> <out-dir>
+
+<raw-dir> holds the unzipped export (memories-000/, projects-000/, conversations-000/).
+Writes:
+  <out-dir>/notes-source/      Claude memory + project instructions, for `bin/import`
+  <out-dir>/conversations/     one digest per conversation (title, summary, the owner's messages),
+                               for retaining into Hindsight with `--retain`
+Assistant replies are dropped: they're long, and Claude's memory already distills them.
+The owner's messages are kept whole, with the extracted text of any attachments.
+
+  prep-claude-export --retain <out-dir> [file …]   retain conversation digests (all, or the
+                                                   given digest files) into Hindsight
+  prep-claude-export --retain-memory <raw-dir>    retain Claude's memory (summary, per-project
+                                                   memory, memory files) into Hindsight
+"""
+import json, pathlib, sys, urllib.request
+
+from brainenv import BASE, OWNER
+MAX_ATTACHMENT = 20000  # chars kept per attachment's extracted text
+
+
+def load(p):
+    return json.loads(pathlib.Path(p).read_text(encoding="utf-8"))
+
+
+def prep(raw, out):
+    raw, out = pathlib.Path(raw), pathlib.Path(out)
+    notes = out / "notes-source"; convs = out / "conversations"
+    notes.mkdir(parents=True, exist_ok=True); convs.mkdir(parents=True, exist_ok=True)
+
+    projects = {}
+    for f in sorted((raw / "projects-000/projects").glob("*.json")):
+        p = load(f); projects[p["uuid"]] = p["name"].strip()
+    name = lambda uuid: projects.get(uuid, uuid)
+
+    # Projects: name, description, instructions.
+    lines = ["# Claude projects (claude.ai)\n"]
+    for f in sorted((raw / "projects-000/projects").glob("*.json")):
+        p = load(f)
+        lines += [f"## {p['name'].strip()}",
+                  f"- created {p['created_at'][:10]}, last updated {p['updated_at'][:10]}",
+                  f"- description: {p.get('description') or '-'}",
+                  "- instructions:", "", (p.get("prompt_template") or "(none)").strip(), ""]
+    (notes / "projects.md").write_text("\n".join(lines), encoding="utf-8")
+
+    # Memory: global summary, per-project memory, memory files (project ids → names).
+    m = load(next((raw / "memories-000/memories").glob("*.json")))
+    (notes / "memory-summary.md").write_text(
+        f"# Claude's memory summary of {OWNER} (from all conversations)\n\n" + m["conversations_memory"],
+        encoding="utf-8")
+    pm = ["# Claude per-project memory\n"]
+    for uuid, text in m.get("project_memories", {}).items():
+        pm += [f"## Project: {name(uuid)}", "", text if isinstance(text, str) else json.dumps(text), ""]
+    (notes / "project-memories.md").write_text("\n".join(pm), encoding="utf-8")
+    mf = ["# Claude memory files\n"]
+    for f in sorted(m.get("memory_files", []), key=lambda f: f["path"]):
+        path = f["path"]
+        for uuid, n in projects.items():
+            path = path.replace(uuid, f"project: {n}")
+        mf += [f"## {path}  (updated {f['updated_at'][:10]})", "", f["content"].strip(), ""]
+    (notes / "memory-files.md").write_text("\n".join(mf), encoding="utf-8")
+
+    # Conversations: one digest each.
+    n = 0
+    for c in load(raw / "conversations-000/conversations.json"):
+        human = [x for x in c["chat_messages"] if x["sender"] == "human" and (x.get("text") or "").strip()]
+        if not human:
+            continue
+        body = [f"# {c.get('name') or '(untitled)'}",
+                f"Conversation between {OWNER} and Claude, {c['created_at'][:10]}"
+                f" (last message {c['updated_at'][:10]}).", ""]
+        if c.get("summary"):
+            body += ["## Summary", c["summary"].strip(), ""]
+        body += [f"## {OWNER}'s messages"]
+        for x in human:
+            body += ["", f"[{x['created_at'][:10]}] " + x["text"].strip()]
+            for a in x.get("attachments", []):
+                t = (a.get("extracted_content") or "").strip()
+                if t:
+                    body += ["", f"Attachment {a.get('file_name') or '(unnamed)'}:", "",
+                             t[:MAX_ATTACHMENT] + (" […]" if len(t) > MAX_ATTACHMENT else "")]
+        meta = {"uuid": c["uuid"], "created_at": c["created_at"], "name": c.get("name") or ""}
+        (convs / f"{c['created_at'][:10]}-{c['uuid'][:8]}.md").write_text("\n".join(body), encoding="utf-8")
+        (convs / f"{c['created_at'][:10]}-{c['uuid'][:8]}.json").write_text(json.dumps(meta), encoding="utf-8")
+        n += 1
+    size = lambda d: sum(p.stat().st_size for p in d.glob("*.md"))
+    print(f"notes-source: {len(list(notes.glob('*.md')))} files, {size(notes):,} bytes")
+    print(f"conversations: {n} digests, {size(convs):,} bytes")
+
+
+def post(item):
+    req = urllib.request.Request(f"{BASE}/memories", method="POST",
+                                 data=json.dumps({"items": [item], "async": True}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=120).read()
+
+
+def retain(out, only=()):
+    convs = pathlib.Path(out) / "conversations"
+    files = [pathlib.Path(f) for f in only] if only else sorted(convs.glob("*.md"))
+    for i, f in enumerate(files, 1):
+        meta = json.loads(f.with_suffix(".json").read_text())
+        post({"content": f.read_text(encoding="utf-8"), "document_id": f"claude-chat:{meta['uuid']}",
+              "timestamp": meta["created_at"], "tags": ["claude-chat"],
+              "context": f"claude.ai conversation: {meta['name']}"})
+        print(f"[{i}/{len(files)}] queued {f.name}", flush=True)
+
+
+def retain_memory(raw):
+    """Claude's own memory: one document per memory file, dated by its last update."""
+    raw = pathlib.Path(raw)
+    projects = {load(f)["uuid"]: load(f)["name"].strip()
+                for f in (raw / "projects-000/projects").glob("*.json")}
+    m = load(next((raw / "memories-000/memories").glob("*.json")))
+    items = [{"content": m["conversations_memory"], "document_id": "claude-memory:summary",
+              "context": f"claude.ai memory: Claude's summary of {OWNER} from all conversations"}]
+    for uuid, text in m.get("project_memories", {}).items():
+        items.append({"content": text if isinstance(text, str) else json.dumps(text),
+                      "document_id": f"claude-memory:project:{uuid}",
+                      "context": f"claude.ai memory for project {projects.get(uuid, uuid)}"})
+    for f in m.get("memory_files", []):
+        path = f["path"]
+        for uuid, n in projects.items():
+            path = path.replace(uuid, f"project: {n}")
+        if not f["content"].strip() or path.endswith("/index.md"):
+            continue
+        items.append({"content": f"{path}\n\n{f['content']}", "document_id": f"claude-memory:file:{f['path']}",
+                      "timestamp": f["updated_at"], "context": f"claude.ai memory file {path}"})
+    for i, item in enumerate(items, 1):
+        item["tags"] = ["claude-memory"]
+        post(item)
+        print(f"[{i}/{len(items)}] queued {item['document_id']}", flush=True)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--retain":
+        retain(sys.argv[2], sys.argv[3:])
+    elif len(sys.argv) == 3 and sys.argv[1] == "--retain-memory":
+        retain_memory(sys.argv[2])
+    elif len(sys.argv) == 3:
+        prep(sys.argv[1], sys.argv[2])
+    else:
+        print(__doc__); sys.exit(1)

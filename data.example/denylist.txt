@@ -1,0 +1,6 @@
+# Strings that must never appear in the public engine repo (checked case-insensitively by
+# bin/leak-check in its pre-commit, commit-msg and pre-push hooks). One per line.
+# Add your full name, email addresses, phone numbers, street, employer, people's names, and
+# anything else that identifies you. This file stays in the private data repo.
+# A line "!text" allows text containing a denied string (e.g. a public handle with your surname).
+{{OWNER}}

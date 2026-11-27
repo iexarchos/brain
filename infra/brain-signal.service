@@ -1,0 +1,22 @@
+[Unit]
+Description=signal-cli daemon for brain's Signal number (JSON-RPC on a UNIX socket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=brain
+EnvironmentFile=/home/brain/.config/brain/signal.env
+ExecStartPre=/usr/bin/mkdir -p /home/brain/.cache/signal-cli
+ExecStartPre=/usr/bin/rm -f /home/brain/.local/state/brain/signal.sock
+# signal-cli unpacks a ~190 MB native library into java.io.tmpdir on every start. /tmp is a
+# RAM-backed tmpfs on this host, so keep it on disk (-D works with the native build).
+# on-connection: only fetch messages while the bridge is connected, so none are dropped.
+ExecStart=/home/brain/.local/bin/signal-cli -Djava.io.tmpdir=/home/brain/.cache/signal-cli -a ${BRAIN_SIGNAL_ACCOUNT} daemon \
+  --socket /home/brain/.local/state/brain/signal.sock --receive-mode on-connection \
+  --ignore-attachments --ignore-stories --ignore-avatars --ignore-stickers --send-read-receipts
+Restart=on-failure
+RestartSec=10
+MemoryHigh=250M
+
+[Install]
+WantedBy=multi-user.target

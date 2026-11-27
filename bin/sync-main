@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# sync-main — fast-forward main in both checkouts (engine and data/) at the start of each session.
+#
+# Run by the SessionStart hooks (Claude Code and Codex; see infra/README.md), so edits and merges made on GitHub
+# show up here before the session reads anything. For each repo: only acts on main with no
+# uncommitted changes to tracked files; fast-forward only, never merges or rebases. Also prunes
+# local branches that were merged and deleted on GitHub. If data/knowledge/ changed, reindexes
+# Hindsight in the background. Always exits 0 so a failed pull never blocks a session.
+. "$(dirname "$0")/brain-env.sh"
+
+# sync <dir> <label>: prune merged branches, then fast-forward main. Sets BEFORE to the old HEAD
+# when it pulled anything, else to empty.
+sync() {
+  local dir="$1" label="$2" b track after
+  BEFORE=""
+  [ -d "$dir/.git" ] || return 0
+  # Drop remote-tracking refs for branches deleted on GitHub (merged PR branches are auto-deleted
+  # there), then delete local branches whose upstream is gone and that are fully contained in
+  # origin/main. Never touches main, memory-backup or unmerged work.
+  if timeout 15 git -C "$dir" fetch -q --prune origin 2>/dev/null; then
+    git -C "$dir" for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads |
+    while read -r b track; do
+      case "$b" in main|memory-backup) continue ;; esac
+      [ "$track" = "[gone]" ] || continue
+      git -C "$dir" merge-base --is-ancestor "$b" origin/main 2>/dev/null || continue
+      git -C "$dir" branch -q -D "$b" 2>/dev/null && echo "sync-main: $label: deleted merged branch $b"
+    done
+  fi
+  [ "$(git -C "$dir" branch --show-current)" = main ] || return 0
+  [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] || return 0
+  local before; before="$(git -C "$dir" rev-parse HEAD)"
+  timeout 15 git -C "$dir" pull -q --ff-only 2>/dev/null || return 0
+  after="$(git -C "$dir" rev-parse HEAD)"
+  [ "$before" = "$after" ] && return 0
+  echo "sync-main: $label: pulled $(git -C "$dir" rev-list --count "$before..$after") commit(s) from GitHub"
+  BEFORE="$before"
+}
+
+sync "$REPO" engine
+sync "$DATA" data
+if [ -n "$BEFORE" ] && [ -n "$(git -C "$DATA" diff --name-only "$BEFORE" HEAD -- knowledge/)" ]; then
+  mkdir -p "$HOME/.local/state/brain"
+  nohup flock -n "$HOME/.local/state/brain/reindex.lock" "$REPO/bin/reindex" \
+    >> "$HOME/.local/state/brain/sync-main-reindex.log" 2>&1 < /dev/null &
+fi
+exit 0

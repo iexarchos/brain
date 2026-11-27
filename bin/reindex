@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""reindex — sync data/knowledge/ notes into Hindsight.
+
+  reindex            # retain new/changed notes, delete removed ones
+  reindex --all      # re-retain every note
+  reindex --dry-run  # show what would change
+
+Each note becomes one Hindsight document with id "note:<path>" (path relative to the data
+repo, e.g. note:knowledge/me/profile.md), so re-retaining a changed note replaces its old facts. Content hashes are kept in ~/.local/state/brain/reindex.json.
+"""
+import argparse, hashlib, json, pathlib, re, sys, urllib.error, urllib.parse, urllib.request
+
+from brainenv import BASE, DATA, OWNER
+
+KNOWLEDGE = DATA / "knowledge"
+STATE = pathlib.Path.home() / ".local/state/brain/reindex.json"
+
+
+def call(method, url, body=None, timeout=600):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def notes():
+    for p in sorted(KNOWLEDGE.rglob("*.md")):
+        rel = p.relative_to(DATA).as_posix()
+        if "/_templates/" not in rel:
+            yield rel, p.read_text(encoding="utf-8")
+
+
+def timestamp(rel, text):
+    """Journal entries happened on their date; other notes use `updated:`, else are timeless."""
+    m = re.search(r"journal/(\d{4}-\d{2}-\d{2})\.md$", rel) or \
+        re.search(r"^updated:\s*(\d{4}-\d{2}-\d{2})\s*$", text, re.M)
+    return f"{m.group(1)}T12:00:00Z" if m else "unset"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--all", action="store_true", help="re-retain every note")
+    ap.add_argument("--dry-run", action="store_true", help="show changes without applying")
+    args = ap.parse_args()
+    if not KNOWLEDGE.is_dir():
+        sys.exit(f"reindex: no notes at {KNOWLEDGE} (see bin/init-data)")
+
+    state = {} if args.all or not STATE.exists() else json.loads(STATE.read_text())
+    current = {rel: (text, hashlib.sha256(text.encode()).hexdigest()) for rel, text in notes()}
+    changed = [rel for rel, (_, h) in current.items() if state.get(rel) != h]
+    removed = [rel for rel in state if rel not in current]
+
+    if not changed and not removed:
+        print("reindex: up to date")
+        return
+    for rel in changed:
+        print(f"reindex: {'would retain' if args.dry_run else 'retain'} {rel}")
+    for rel in removed:
+        print(f"reindex: {'would delete' if args.dry_run else 'delete'} {rel}")
+    if args.dry_run:
+        return
+
+    failed = 0
+    for rel in changed:
+        text, h = current[rel]
+        item = {"content": text, "document_id": f"note:{rel}", "timestamp": timestamp(rel, text),
+                "context": f"knowledge note {rel} from {OWNER}'s brain repo",
+                "tags": ["knowledge", rel.split("/")[1]]}
+        try:
+            call("POST", f"{BASE}/memories", {"items": [item]})
+            state[rel] = h
+        except (urllib.error.URLError, TimeoutError) as e:
+            failed += 1
+            print(f"reindex: FAILED {rel}: {e}", file=sys.stderr)
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(state, indent=1))  # save progress after each note
+
+    for rel in removed:
+        doc = urllib.parse.quote(f"note:{rel}", safe="")
+        try:
+            call("DELETE", f"{BASE}/documents/{doc}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                failed += 1
+                print(f"reindex: FAILED delete {rel}: {e}", file=sys.stderr)
+                continue
+        state.pop(rel, None)
+    STATE.write_text(json.dumps(state, indent=1))
+
+    retained = sum(1 for rel in changed if state.get(rel) == current[rel][1])
+    print(f"reindex: {retained} retained, {len(removed)} removed, {failed} failed")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

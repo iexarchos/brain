@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""signal-bridge — chat with brain from the phone over Signal.
+
+Connects to the signal-cli daemon's JSON-RPC socket (brain-signal.service), takes text messages
+from the owner only, runs each one through `claude -p` in the repo and sends the reply back.
+Messages are handled one at a time. Each chat has its own Claude session: the direct chat, plus
+any Signal group the owner creates with brain's number (one group per topic; a new group starts a
+new conversation on its first message). In groups only the owner's messages are answered. Everyone
+else is ignored (and logged, so the owner's UUID can be found).
+
+Commands (sent as a Signal message; they act on the chat they are sent in):
+  /new       start a new conversation
+  /private   start a new conversation that is NOT saved to Hindsight (until the next /new)
+  /help      list commands
+
+Config, from the environment (brain-signal-bridge.service reads ~/.config/brain/signal.env;
+OWNER_NAME comes from data/brain.env):
+  BRAIN_SIGNAL_OWNER   owner's number (+15551234567) and/or Signal UUID, comma-separated
+  BRAIN_SIGNAL_SOCKET  daemon socket (default ~/.local/state/brain/signal.sock)
+  BRAIN_SIGNAL_TIMEOUT seconds per Claude run (default 600)
+"""
+import itertools
+import json
+import os
+import queue
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+from brainenv import OWNER as OWNER_NAME, REPO
+STATE = Path.home() / ".local/state/brain"
+SESSION_FILE = STATE / "signal-session.json"  # {chat key: session}; key "dm" or "group:<id>"
+SOCKET = os.environ.get("BRAIN_SIGNAL_SOCKET", str(STATE / "signal.sock"))
+OWNER = {s.strip() for s in os.environ.get("BRAIN_SIGNAL_OWNER", "").split(",") if s.strip()}
+TIMEOUT = int(os.environ.get("BRAIN_SIGNAL_TIMEOUT", "600"))
+
+# Headless runs can't answer permission prompts, so anything not listed here is denied.
+# Same reach as a normal session: read/edit the repos, memory, Drive (read-only), web, git.
+# Notes live in the data repo (data/), so its git commands are allowed via `git -C data`.
+TOOLS = [
+    "Read", "Grep", "Glob", "Edit", "Write", "WebSearch", "WebFetch",
+    "mcp__hindsight-memory__*",
+    "mcp__claude_ai_Google_Drive__search_files", "mcp__claude_ai_Google_Drive__read_file_content",
+    "mcp__claude_ai_Google_Drive__get_file_metadata",
+    "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git add:*)",
+    "Bash(git commit:*)", "Bash(git pull:*)", "Bash(git push:*)", "Bash(rg:*)",
+    "Bash(git -C data status:*)", "Bash(git -C data diff:*)", "Bash(git -C data log:*)",
+    "Bash(git -C data add:*)", "Bash(git -C data commit:*)", "Bash(git -C data pull:*)",
+    "Bash(git -C data push:*)",
+    "Bash(bin/council-bg:*)",
+]
+CHANNEL_PROMPT = (
+    f"{OWNER_NAME} (the owner) is messaging you over Signal from a phone. Keep replies short and readable on a "
+    "small screen: plain text, short paragraphs or simple lists, no tables or headings. "
+    "You can't ask for tool permissions here; if something needs a tool you don't have, say "
+    "so and suggest doing it over SSH. To run a council, write the question to "
+    "data/runs/council-question-<timestamp>.md and run `bin/council-bg [-m ..] [-s ..] [--no-pr] -f "
+    "<that file>`; it returns at once and the council opens a PR when done, so just confirm it started."
+)
+HELP = (
+    "/new — start a new conversation\n"
+    "/private — new conversation, not saved to memory\n"
+    "/help — this list"
+)
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+class Signal:
+    """Minimal JSON-RPC client for `signal-cli daemon --socket`."""
+
+    def __init__(self, path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        self.reader = self.sock.makefile("r", encoding="utf-8")
+        self.lock = threading.Lock()
+        self.ids = itertools.count(1)
+
+    def call(self, method, **params):
+        msg = {"jsonrpc": "2.0", "method": method, "params": params, "id": next(self.ids)}
+        with self.lock:
+            self.sock.sendall((json.dumps(msg) + "\n").encode())
+
+    # `to` is {"recipient": [uuid]} for the direct chat or {"groupId": id} for a group.
+    def send(self, to, text):
+        self.call("send", message=text, **to)
+
+    def typing(self, to, stop=False):
+        self.call("sendTyping", stop=stop, **to)
+
+    def __iter__(self):
+        for line in self.reader:
+            if line.strip():
+                yield json.loads(line)
+
+
+def load_sessions():
+    try:
+        data = json.loads(SESSION_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {"dm": data} if "id" in data else data  # older files held the single direct-chat session
+
+
+def save_session(chat, s):
+    sessions = load_sessions()
+    sessions[chat] = s
+    STATE.mkdir(parents=True, exist_ok=True)
+    SESSION_FILE.write_text(json.dumps(sessions, indent=1))
+
+
+def new_session(chat, private=False):
+    s = {"id": str(uuid.uuid4()), "started": False, "private": private}
+    save_session(chat, s)
+    return s
+
+
+def ask_claude(chat, name, text):
+    s = load_sessions().get(chat) or new_session(chat)
+    prompt = CHANNEL_PROMPT
+    if name:
+        prompt += (f' This chat is the owner\'s Signal group "{name}", with its own conversation '
+                   "separate from the other chats; assume questions are about that topic.")
+    cmd = ["claude", "-p", text, "--allowedTools", *TOOLS, "--permission-mode", "acceptEdits",
+           "--append-system-prompt", prompt]
+    cmd += ["--resume", s["id"]] if s["started"] else ["--session-id", s["id"]]
+    env = dict(os.environ)
+    if s["private"]:
+        env["HINDSIGHT_RETAIN_SESSIONS"] = "false"
+    try:
+        p = subprocess.run(cmd, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return f"(timed out after {TIMEOUT // 60} min — try a smaller question, or SSH in)"
+    if p.returncode != 0:
+        log(f"claude exited {p.returncode}: {p.stderr.strip()[-2000:]}")
+        return f"(claude failed with status {p.returncode}; see journalctl -u brain-signal-bridge)"
+    if not s["started"]:
+        s["started"] = True
+        save_session(chat, s)
+    return p.stdout.strip() or "(empty reply)"
+
+
+def handle(sig, to, chat, name, text):
+    cmd = text.strip().lower()
+    if cmd == "/new":
+        new_session(chat)
+        sig.send(to, "New conversation.")
+        return
+    if cmd == "/private":
+        new_session(chat, private=True)
+        sig.send(to, "New private conversation — not saved to memory until /new.")
+        return
+    if cmd == "/help":
+        sig.send(to, HELP)
+        return
+
+    done = threading.Event()
+
+    def keep_typing():  # Signal drops the indicator after ~15 s
+        while not done.wait(10):
+            sig.typing(to)
+
+    sig.typing(to)
+    threading.Thread(target=keep_typing, daemon=True).start()
+    try:
+        reply = ask_claude(chat, name, text)
+    finally:
+        done.set()
+        sig.typing(to, stop=True)
+    sig.send(to, reply)
+
+
+def worker(sig, jobs):
+    while True:
+        to, chat, name, text = jobs.get()
+        try:
+            handle(sig, to, chat, name, text)
+        except Exception as e:  # keep serving after a bad message
+            log(f"error handling message: {e!r}")
+            try:
+                sig.send(to, f"(bridge error: {e})")
+            except OSError:
+                pass
+
+
+def run():
+    sig = Signal(SOCKET)
+    log(f"connected to {SOCKET}; owner: {', '.join(sorted(OWNER))}")
+    jobs = queue.Queue()
+    threading.Thread(target=worker, args=(sig, jobs), daemon=True).start()
+    for msg in sig:
+        if msg.get("method") != "receive":
+            if "error" in msg:
+                log(f"rpc error: {msg['error']}")
+            continue
+        env = msg["params"].get("envelope", {})
+        data = env.get("dataMessage") or {}
+        text = data.get("message")
+        if not text:
+            continue
+        ids = {env.get("sourceNumber"), env.get("sourceUuid")} - {None}
+        if not ids & OWNER:
+            log(f"ignored message from {', '.join(sorted(ids))}")
+            continue
+        group = data.get("groupInfo") or data.get("groupV2") or {}
+        if group.get("groupId"):
+            to, chat = {"groupId": group["groupId"]}, "group:" + group["groupId"]
+            name = group.get("groupName") or "untitled"
+        else:
+            # Reply to the UUID: the number may be hidden by Signal's number privacy.
+            to = {"recipient": [env.get("sourceUuid") or env.get("sourceNumber")]}
+            chat, name = "dm", None
+        jobs.put((to, chat, name, text))
+    raise ConnectionError("signal-cli closed the socket")
+
+
+def main():
+    if not OWNER:
+        sys.exit("signal-bridge: set BRAIN_SIGNAL_OWNER")
+    os.environ["PATH"] = os.pathsep.join(
+        [str(REPO / "bin"), str(Path.home() / ".local/bin"), str(Path.home() / ".npm-global/bin"),
+         os.environ.get("PATH", "")])
+    while True:  # the daemon may start after us or restart; reconnect
+        try:
+            run()
+        except (OSError, ValueError) as e:
+            log(f"disconnected ({e}); retrying in 5 s")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

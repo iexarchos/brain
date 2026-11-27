@@ -1,0 +1,13 @@
+[Unit]
+Description=brain nightly reflect: fold Hindsight memories into knowledge/ and open a PR
+After=hindsight.service network-online.target
+Wants=hindsight.service
+
+[Service]
+Type=oneshot
+User=brain
+WorkingDirectory=/home/brain/brain
+# Long-lived Claude token for headless runs (see infra/README.md §2); optional.
+EnvironmentFile=-/home/brain/.config/brain/claude.env
+ExecStart=/home/brain/brain/bin/nightly
+TimeoutStartSec=45min

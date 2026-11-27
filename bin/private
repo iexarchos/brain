@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# private — run an agent session that is NOT saved to Hindsight. Recall still works, so the
+# session can use existing memory; it just doesn't add to it.
+#
+#   private              # claude
+#   private codex        # any agent CLI, with its arguments
+#
+# To remove a session that was already saved, use `forget`.
+export HINDSIGHT_RETAIN_SESSIONS=false
+[ $# -eq 0 ] && set -- claude
+echo "private: this session will not be saved to memory" >&2
+exec "$@"

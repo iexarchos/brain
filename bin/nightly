@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# nightly — fold recent Hindsight memories into data/knowledge/ and open a PR for review.
+#
+#   nightly            # normal run (used by brain-nightly.timer)
+#   nightly --dry-run  # gather facts and show them; no agent, no git changes
+#
+# Steps: pull main → reindex notes → collect facts created since the last run (excluding facts
+# derived from the notes themselves) → Claude edits data/knowledge/ on a branch of the data repo →
+# PR there if anything changed. Output is logged to data/runs/nightly-<date>.log; failures and
+# warnings open a "Nightly failed" issue (on the data repo: logs can hold personal details).
+set -euo pipefail
+
+. "$(dirname "$0")/brain-env.sh"
+require_data
+STATE_DIR="$HOME/.local/state/brain"
+LAST="$STATE_DIR/nightly-last-run"
+API="${HINDSIGHT_API_URL:-http://127.0.0.1:8888}/v1/default/banks/$HINDSIGHT_BANK_ID"
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
+export HINDSIGHT_DISABLE_HOOKS=1   # don't retain this job's own session
+export PATH="$REPO/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+
+mkdir -p "$STATE_DIR" "$DATA/runs"
+cd "$DATA"   # git and gh below act on the data repo
+since="$(cat "$LAST" 2>/dev/null || date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)"
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+today="$(date +%Y-%m-%d)"
+
+# Keep this run's output in runs/, and on failure or warnings open (or comment on) a GitHub
+# issue, so a broken run doesn't just look like a quiet night with no PR.
+log="$DATA/runs/nightly-$today.log"
+exec 3>&1 4>&2   # keep the original stdout/stderr (the journal) for the exit trap
+exec > >(tee -a "$log") 2>&1
+tee_pid=$!
+warnings=()
+ISSUE_TITLE="Nightly failed"
+alert() {
+  local body num
+  body="$(printf '%s\n\n```\n%s\n```\n' "$1" "$(tail -n 60 "$log")")"
+  num="$(gh issue list --state open --json number,title \
+    -q ".[] | select(.title == \"$ISSUE_TITLE\") | .number" 2>/dev/null | head -1)"
+  if [ -n "$num" ]; then
+    gh issue comment "$num" --body "$body" >/dev/null
+  else
+    gh issue create --title "$ISSUE_TITLE" --label bug --body "$body" >/dev/null
+  fi || echo "nightly: could not report the problem to GitHub" >&2
+}
+on_exit() {
+  local rc=$?
+  # Detach from tee and wait for it, so the run's last lines reach the log before alert() reads it
+  # (and before a successful run exits, which used to drop its final line now and then).
+  exec >&3 2>&4
+  wait "$tee_pid" 2>/dev/null || true
+  [ $DRY -eq 1 ] && return
+  if [ $rc -ne 0 ]; then
+    alert "Run on $today exited with status $rc."
+  elif [ ${#warnings[@]} -gt 0 ]; then
+    alert "Run on $today finished with warnings: ${warnings[*]}."
+  fi
+}
+trap on_exit EXIT
+
+# Back up first: the backup uses its own worktree (~/brain-memory-backup), so a dirty checkout
+# that aborts the rest of the run must not skip it.
+[ $DRY -eq 0 ] && { backup-memory || { echo "nightly: WARNING memory backup failed" >&2; warnings+=("memory backup failed"); }; }
+if [ -n "$(git status --porcelain)" ]; then
+  echo "nightly: working tree not clean; aborting" >&2; exit 1
+fi
+git checkout -q main
+git pull -q --rebase
+# Push any session commits that never made it to GitHub.
+[ -n "$(git rev-list origin/main..main)" ] && git push -q origin main
+
+[ $DRY -eq 0 ] && reindex
+
+# Signal rejects signal-cli releases older than ~3 months, and the native build isn't covered by
+# apt, so open an issue when a newer release is out. Installing stays manual (signature check).
+signal_cli_check() {
+  local have want title
+  have="$(signal-cli --version 2>/dev/null | awk '{print $2}')"
+  want="$(gh api repos/AsamK/signal-cli/releases/latest -q .tag_name 2>/dev/null)"; want="${want#v}"
+  if [ -z "$have" ] || [ -z "$want" ]; then
+    echo "nightly: could not compare signal-cli versions (have '${have}', latest '${want}')"; return
+  fi
+  [ "$have" = "$want" ] && return
+  title="signal-cli $want available"
+  if [ -n "$(gh issue list --state open --search "in:title \"$title\"" --json number -q '.[].number' 2>/dev/null)" ]; then
+    return
+  fi
+  gh issue create --title "$title" --label enhancement --body "$(cat <<EOF
+Installed: $have · latest: $want ([release notes](https://github.com/AsamK/signal-cli/releases/tag/v$want)).
+Signal stops accepting old clients after about three months, so the Signal bridge goes silent
+if this waits too long. Update over SSH:
+
+\`\`\`bash
+v=$want; mkdir -p ~/.cache && cd ~/.cache   # not /tmp: it is RAM-backed here
+gh release download v\$v -R AsamK/signal-cli -p "signal-cli-\$v-Linux-native.tar.gz*"
+gpg --verify signal-cli-\$v-Linux-native.tar.gz.asc   # must say "Good signature from AsamK"
+mkdir -p ~/.local/opt/signal-cli-\$v && tar -xzf signal-cli-\$v-Linux-native.tar.gz -C ~/.local/opt/signal-cli-\$v && rm signal-cli-\$v-Linux-native.tar.gz*
+ln -sfn ~/.local/opt/signal-cli-\$v/signal-cli ~/.local/bin/signal-cli
+sudo systemctl restart brain-signal brain-signal-bridge && signal-cli --version
+\`\`\`
+
+Then send brain a test message. Close this issue once done; the nightly job opens a new one for
+the next release.
+EOF
+)" >/dev/null && echo "nightly: opened issue: $title" || echo "nightly: could not open signal-cli issue" >&2
+}
+[ $DRY -eq 0 ] && signal_cli_check
+
+# Two Claude credentials can lapse. The interactive sign-in (`claude auth login`) serves the Signal
+# bridge and terminal sessions; the setup-token in ~/.config/brain/claude.env (one year) serves this
+# job, the weekly review and Hindsight. Warn before either ends.
+claude_auth_check() {
+  local exp tokfile="$HOME/.config/brain/claude.env" left
+  exp="$(env -u CLAUDE_CODE_OAUTH_TOKEN claude auth status 2>/dev/null | python3 -c '
+import json, sys, datetime as dt
+s = json.load(sys.stdin)
+if not s.get("loggedIn"): print("not-logged-in"); sys.exit()
+e = s.get("loginExpiresAt")
+if e and dt.datetime.fromisoformat(e.replace("Z", "+00:00")) - dt.datetime.now(dt.timezone.utc) < dt.timedelta(days=7):
+    print(e[:10])
+' 2>/dev/null)" || true
+  if [ -n "$exp" ]; then
+    echo "nightly: WARNING interactive Claude sign-in: $exp" >&2
+    warnings+=("interactive Claude sign-in (Signal bridge, terminal) ends $exp; run 'claude auth login'")
+  fi
+  if [ -f "$tokfile" ]; then
+    # setup-token doesn't report an expiry; it lasts one year from when the file was written.
+    left=$(( ( $(stat -c %Y "$tokfile") + 365*86400 - $(date +%s) ) / 86400 ))
+    if [ "$left" -lt 14 ]; then
+      echo "nightly: WARNING Claude setup-token expires in ~$left days" >&2
+      warnings+=("Claude setup-token in ~/.config/brain/claude.env expires in ~$left days; renew it (infra/README.md §2)")
+    fi
+  else
+    warnings+=("no Claude setup-token in ~/.config/brain/claude.env; headless jobs depend on the interactive sign-in")
+  fi
+}
+[ $DRY -eq 0 ] && claude_auth_check
+
+# Codex (ChatGPT login) should renew its token on any run once it is ~8 days old, and the weekly
+# review's keepalive runs it at least weekly. A token unrenewed for 14+ days means that isn't happening.
+codex_auth_check() {
+  local last age
+  last="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.codex/auth.json"))).get("last_refresh") or "")' 2>/dev/null)" || true
+  [ -n "$last" ] || return 0
+  age=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 )) || return 0
+  if [ "$age" -ge 14 ]; then
+    echo "nightly: WARNING Codex token not renewed since ${last:0:10} ($age days)" >&2
+    warnings+=("Codex token not renewed since ${last:0:10} ($age days); run 'codex login' over SSH")
+  fi
+}
+[ $DRY -eq 0 ] && codex_auth_check
+
+facts="$(curl -sf "$API/memories/list?time_field=created_at&start_date=$since&limit=500" | python3 -c '
+import json, sys
+seen, out = set(), []
+for m in json.load(sys.stdin).get("items", []):
+    doc = m.get("document_id") or ""
+    if doc.startswith(("note:", "claude-chat:", "claude-memory:")) or m.get("fact_type") == "observation" or m.get("state") != "valid":
+        continue
+    text = m["text"].strip()
+    if text not in seen:
+        seen.add(text); out.append("- [" + str(m.get("fact_type")) + "] " + text)
+print("\n".join(out))
+')"
+
+if [ -z "$facts" ]; then
+  echo "nightly: no new facts since $since"
+  [ $DRY -eq 0 ] && echo "$now" > "$LAST"
+  exit 0
+fi
+echo "nightly: $(printf '%s\n' "$facts" | wc -l) new facts since $since"
+if [ $DRY -eq 1 ]; then printf '%s\n' "$facts"; exit 0; fi
+
+branch="reflect/$today"
+git checkout -q -B "$branch"
+run="$DATA/runs/nightly-$today"
+mkdir -p "$run"
+{ render "$REPO/prompts/reflect.md"; printf '\nToday is %s.\n\n%s\n' "$today" "$facts"; } > "$run/prompt.md"
+
+# Run from the engine root, so the agent loads AGENTS.md and data/AGENTS.md.
+engine_before="$(git -C "$REPO" status --porcelain)"
+(cd "$REPO" && claude -p "$(cat "$run/prompt.md")" \
+  --allowedTools Read Grep Glob Edit Write "mcp__hindsight-memory__*" \
+  --permission-mode acceptEdits --no-session-persistence < /dev/null > "$run/summary.md")
+
+# Safety: only data/knowledge/ may change; the engine repo must be untouched.
+if [ "$(git -C "$REPO" status --porcelain)" != "$engine_before" ]; then
+  echo "nightly: agent changed the engine repo; review by hand (git -C $REPO status)" >&2
+  git -C "$REPO" status --porcelain >&2
+  git checkout -q -- . && git clean -fdq -- knowledge && git checkout -q main; exit 1
+fi
+if git status --porcelain | grep -qv ' knowledge/'; then
+  echo "nightly: agent changed files outside data/knowledge/; discarding" >&2
+  git status --porcelain >&2
+  git checkout -q -- . && git clean -fdq -- . ':!runs'
+  git checkout -q main; exit 1
+fi
+
+if [ -z "$(git status --porcelain)" ]; then
+  echo "nightly: nothing durable to add"
+  git checkout -q main; git branch -q -D "$branch"
+else
+  git add knowledge
+  git commit -q -m "knowledge: nightly reflect $today
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+  git push -q -f -u origin "$branch"
+  if ! gh pr view "$branch" >/dev/null 2>&1; then
+    gh pr create --base main --head "$branch" --title "Nightly reflect: $today" \
+      --body "$(cat "$run/summary.md"; printf '\n\n---\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n')" >/dev/null
+  fi
+  echo "nightly: opened PR $(gh pr view "$branch" --json url -q .url)"
+  git checkout -q main
+fi
+echo "$now" > "$LAST"

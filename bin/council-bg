@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# council-bg — start bin/council detached and return at once. Made for the Signal bridge,
+# whose turns are killed after BRAIN_SIGNAL_TIMEOUT; the run opens its own PR when done.
+#
+#   council-bg [council options] "question"
+#   council-bg [council options] -f question.md     # question read from a file
+#
+# Runs as a transient systemd user unit (linger is on), so it survives the calling session
+# and bridge restarts; falls back to setsid if the user manager can't be reached.
+# Output goes to data/runs/council-<timestamp>.log.
+set -euo pipefail
+
+. "$(dirname "$0")/brain-env.sh"
+require_data
+usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+args=(); file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f) [ $# -ge 2 ] || usage 1; file="$2"; shift 2 ;;
+    -h) usage 0 ;;
+    *)  args+=("$1"); shift ;;
+  esac
+done
+if [ -n "$file" ]; then
+  q="$(cat "$file")"; [ -n "$q" ] || { echo "council-bg: $file is empty" >&2; exit 1; }
+  args+=("$q")
+fi
+[ ${#args[@]} -gt 0 ] || usage 1
+
+stamp="$(date +%Y%m%d-%H%M%S)"
+unit="council-$stamp"
+mkdir -p "$DATA/runs"
+log="$DATA/runs/$unit.log"
+
+# Don't let the caller's Claude Code session leak into the members' claude runs.
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
+
+# Carry the caller's environment (PATH for claude/codex, credentials config) into the unit.
+envargs=()
+while IFS= read -r v; do envargs+=("--setenv=$v"); done < <(compgen -e)
+# Members take turns: this run sits outside the bridge's one-turn-at-a-time lock, and a
+# parallel council next to a Signal reply pushes the 1 GB host deep into swap.
+export COUNCIL_SERIAL=1
+envargs+=("--setenv=COUNCIL_SERIAL=1")
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if systemd-run --user --quiet --collect --unit "$unit" \
+     -p WorkingDirectory="$REPO" -p StandardOutput="append:$log" -p StandardError="append:$log" \
+     "${envargs[@]}" "$REPO/bin/council" "${args[@]}" 2>/dev/null; then
+  echo "council started as user unit $unit; log data/runs/$unit.log; it opens a PR when done"
+else
+  cd "$REPO"
+  setsid nohup "$REPO/bin/council" "${args[@]}" > "$log" 2>&1 < /dev/null &
+  echo "council started detached (pid $!); log data/runs/$unit.log; it opens a PR when done"
+fi

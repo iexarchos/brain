@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""hindsight-hook-filter — run a Hindsight coding-agents hook and drop its page-tool guide.
+
+    hindsight-hook-filter node /home/brain/.hindsight/coding-agents/dist/claude-sessionstart-hook.js
+
+The plugin's SessionStart hook always injects a <hindsight_pages> block telling the agent to call
+hindsight_search_pages and the other tools of the plugin's own `hindsight` MCP server. That server
+is removed on this host (knowledge pages are unused here; memory goes through `hindsight-memory`),
+and the plugin has no setting to turn the block off, so this wrapper strips it from the hook's
+JSON output. Everything else (the banner, exit code, stderr) passes through unchanged, and any
+output it can't parse is passed through as is, so a plugin change can't break session start.
+The per-turn <hindsight_page_refresh> block is turned off in config instead
+(pageRefreshEveryTurns in ~/.hindsight/coding-agent.json).
+"""
+import json
+import re
+import subprocess
+import sys
+
+BLOCK = re.compile(r"<hindsight_pages>.*?</hindsight_pages>\s*", re.S)
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
+        return 2
+    proc = subprocess.run(sys.argv[1:], stdin=sys.stdin.buffer, stdout=subprocess.PIPE)
+    out = proc.stdout
+    try:
+        data = json.loads(out)
+        hso = data.get("hookSpecificOutput")
+        ctx = hso.get("additionalContext") if isinstance(hso, dict) else None
+        if isinstance(ctx, str):
+            ctx = BLOCK.sub("", ctx).strip()
+            if ctx:
+                hso["additionalContext"] = ctx
+            else:
+                del hso["additionalContext"]
+                if set(hso) <= {"hookEventName"}:
+                    del data["hookSpecificOutput"]
+            out = json.dumps(data).encode()
+    except (ValueError, AttributeError, TypeError):
+        pass
+    sys.stdout.buffer.write(out)
+    return proc.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

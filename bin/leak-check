@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# leak-check — keep personal data and secrets out of the public engine repo.
+#
+#   leak-check --staged         staged changes, plus the commit author (pre-commit hook)
+#   leak-check --message FILE   a commit message (commit-msg hook)
+#   leak-check --push           commits about to be pushed: diffs, messages, authors (pre-push hook)
+#   leak-check --tree           every tracked file (run before publishing)
+#
+# Checks against data/denylist.txt (private: one case-insensitive string per line, # comments;
+# a line "!text" allows text that contains a denied string, e.g. a public handle),
+# built-in secret patterns, and paths that belong in the data repo. Exits 1 and shows the hits.
+# The hooks in .githooks/ call it; enable them once per clone: git config core.hooksPath .githooks
+set -uo pipefail
+shopt -s lastpipe
+. "$(dirname "$0")/brain-env.sh"
+cd "$REPO" || exit 2   # always the engine, whatever the cwd
+
+DENY="$DATA/denylist.txt"
+SECRETS='ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{32,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|xox[baprs]-[A-Za-z0-9-]{10,}'
+PATHS='^(data|knowledge|archive|runs)(/|$)|^brain\.env$|^denylist\.txt$'
+
+patterns=""; allowed=""
+if [ -s "$DENY" ]; then
+  patterns="$(grep -v -E '^[[:space:]]*(#|!|$)' "$DENY" || true)"
+  allowed="$(sed -n 's/^!//p' "$DENY")"
+else
+  echo "leak-check: warning: no $DENY; checking secrets and paths only" >&2
+fi
+
+found=0
+# scan <label>: read text on stdin, report denylist and secret hits. Call it with `< <(cmd)`,
+# never at the end of a pipe: a pipe runs it in a subshell and the hit would be lost.
+scan() {
+  local text hits
+  text="$(cat)"
+  [ -n "$text" ] || return 0
+  if [ -n "$patterns" ]; then
+    # Blank out allowed strings first (case-insensitive, same length so line numbers hold).
+    local masked="$text"
+    [ -n "$allowed" ] && masked="$(ALLOWED="$allowed" python3 -c '
+import os, re, sys
+t = sys.stdin.read()
+for a in filter(None, os.environ["ALLOWED"].splitlines()):
+    t = re.sub(re.escape(a), lambda m: "_" * len(m.group()), t, flags=re.I)
+sys.stdout.write(t)' <<<"$text")"
+    hits="$(grep -n -i -F -f <(printf '%s\n' "$patterns") <<<"$masked" || true)"
+    [ -n "$hits" ] && { printf 'leak-check: personal data in %s:\n%s\n' "$1" "$hits" >&2; found=1; }
+  fi
+  hits="$(grep -n -E "$SECRETS" <<<"$text" || true)"
+  [ -n "$hits" ] && { printf 'leak-check: possible secret in %s:\n%s\n' "$1" "$hits" >&2; found=1; }
+  return 0
+}
+scan_paths() {
+  local hits
+  hits="$(grep -E "$PATHS" || true)"
+  [ -n "$hits" ] && { printf 'leak-check: data-repo paths in %s:\n%s\n' "$1" "$hits" >&2; found=1; }
+  return 0
+}
+added() { grep -E '^\+' | grep -v -E '^\+\+\+ '; }
+
+case "${1:-}" in
+  --staged)
+    scan_paths "staged files" < <(git diff --cached --name-only --diff-filter=ACMR)
+    scan "staged file names" < <(git diff --cached --name-only --diff-filter=ACMR)
+    scan "staged changes" < <(git diff --cached -U0 --no-color | added)
+    scan "commit author" < <(git var GIT_AUTHOR_IDENT) ;;
+  --message)
+    scan "commit message" < <(grep -v '^#' "${2:?message file}") ;;
+  --push)
+    # pre-push stdin: <local ref> <local sha> <remote ref> <remote sha>
+    zero=0000000000000000000000000000000000000000
+    while read -r _lref lsha _rref rsha; do
+      [ "$lsha" = "$zero" ] && continue            # branch deletion
+      if [ "$rsha" = "$zero" ]; then range=("$lsha" --not --remotes); else range=("$rsha..$lsha"); fi
+      for c in $(git rev-list "${range[@]}"); do
+        scan "commit $c (author, message)" < <(git log -1 --format='%an <%ae>%n%cn <%ce>%n%B' "$c")
+        scan_paths "commit $c" < <(git diff-tree -r --root --no-commit-id --name-only "$c")
+        scan "commit $c (file names)" < <(git diff-tree -r --root --no-commit-id --name-only "$c")
+        scan "commit $c (changes)" < <(git show --format= -U0 --no-color "$c" | added)
+      done
+    done ;;
+  --tree)
+    scan_paths "tracked files" < <(git ls-files)
+    scan "file names" < <(git ls-files)
+    scan "tracked files" < <(git ls-files -z | xargs -0 grep -I -n -H '' 2>/dev/null) ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
+
+if [ $found -ne 0 ]; then
+  echo "leak-check: blocked. Move personal content to data/ (or edit data/denylist.txt if this is a false positive)." >&2
+  exit 1
+fi
+exit 0

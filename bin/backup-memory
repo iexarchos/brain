@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# backup-memory — dump the Hindsight database to the `memory-backup` branch and push it.
+#
+#   backup-memory
+#
+# Writes a plain-SQL pg_dump (text, so git stores only daily deltas) to hindsight.sql in a
+# separate worktree (~/brain-memory-backup) on the orphan branch `memory-backup` of the private
+# data repo (the dump is personal memory; never the engine repo), so main's history stays clean. The llm_requests table (a log of LLM calls) is dumped schema-only.
+# Restore: see infra/hindsight/README.md.
+set -euo pipefail
+
+. "$(dirname "$0")/brain-env.sh"
+require_data
+WT="${BACKUP_WORKTREE:-$HOME/brain-memory-backup}"
+BRANCH=memory-backup
+PG="$HOME/.pg0/instances/hindsight/instance.json"
+BIN="$(python3 -c "import json;print(json.load(open('$PG'))['installation_dir'])")"
+BIN="$(ls -d "$BIN"/*/bin | head -1)"
+read -r PORT USER DB PASS < <(python3 -c "
+import json; d=json.load(open('$PG')); print(d['port'], d['username'], d['database'], d['password'])")
+
+if [ ! -d "$WT/.git" ] && [ ! -f "$WT/.git" ]; then
+  cd "$DATA"
+  if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+    git fetch -q origin "$BRANCH" && git worktree add -q "$WT" "$BRANCH"
+  else
+    git worktree add -q --orphan -b "$BRANCH" "$WT"
+  fi
+fi
+
+cd "$WT"
+PGPASSWORD="$PASS" "$BIN/pg_dump" -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" \
+  --no-owner --exclude-table-data=llm_requests -f hindsight.sql.tmp
+mv hindsight.sql.tmp hindsight.sql
+cat > README.md <<'EOF'
+# memory-backup
+
+Nightly plain-SQL dump of the Hindsight database (`hindsight.sql`), written by the engine's
+`bin/backup-memory`. Restore instructions: `infra/hindsight/README.md` in the engine repo.
+EOF
+
+git add hindsight.sql README.md
+if git diff --cached --quiet; then
+  echo "backup-memory: no changes"
+else
+  git commit -q -m "Hindsight backup $(date -u +%Y-%m-%dT%H:%MZ)"
+  git push -q -u origin "$BRANCH" 2>/dev/null
+  echo "backup-memory: pushed $(du -h hindsight.sql | cut -f1) dump to $BRANCH"
+  # Each ~21 MB dump lands as a loose object, far below git's auto-gc threshold, so .git grew
+  # by ~20 MB a day. Packing stores dumps as deltas of each other (123 MB -> 8 MB on 2026-11-04).
+  git gc -q || true
+fi

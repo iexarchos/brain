@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# council — ask several models the same question, then have one synthesize the answers.
+#
+#   council "question"                 # members: claude,codex  synthesizer: claude
+#   council -m codex,claude -s codex "question"
+#   echo "long question" | council
+#   council --no-pr "quick question"   # don't open a PR for this run
+#
+# Members run in parallel (one at a time with COUNCIL_SERIAL=1) from the engine root, read-only, so they see AGENTS.md and data/knowledge/.
+# Everything lands in data/runs/<timestamp>-<slug>/ ; the final answer is also printed, and opened
+# as a PR on the data repo adding archive/council/<date>-<slug>.md for review (merge = archive it).
+# archive/ is outside knowledge/, so archived answers are never indexed into Hindsight.
+set -euo pipefail
+
+. "$(dirname "$0")/brain-env.sh"
+require_data
+MEMBERS="claude,codex"
+SYNTH="claude"
+TIMEOUT="${COUNCIL_TIMEOUT:-600}"
+
+PR=1
+
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# --no-pr is a long option; strip it before getopts.
+args=()
+for a in "$@"; do [ "$a" = "--no-pr" ] && PR=0 || args+=("$a"); done
+set -- "${args[@]+"${args[@]}"}"
+while getopts "m:s:h" opt; do
+  case $opt in
+    m) MEMBERS="$OPTARG" ;;
+    s) SYNTH="$OPTARG" ;;
+    h) usage 0 ;;
+    *) usage 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+PROMPT="${*:-}"
+[ -z "$PROMPT" ] && [ ! -t 0 ] && PROMPT="$(cat)"
+[ -z "$PROMPT" ] && usage 1
+
+slug="$(printf '%s' "$PROMPT" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | cut -c1-40 | sed 's/-$//')"
+RUN="$DATA/runs/$(date +%Y%m%d-%H%M%S)-$slug"
+mkdir -p "$RUN"
+printf '%s\n' "$PROMPT" > "$RUN/prompt.md"
+
+# ask <model> <prompt> <outfile>: one read-only, non-persistent call to a model CLI.
+# Hindsight hooks are disabled so council calls aren't retained as sessions; members can
+# still query memory through the hindsight-memory MCP tools.
+export HINDSIGHT_DISABLE_HOOKS=1
+ask() {
+  local model="$1" prompt="$2" out="$3"
+  case "$model" in
+    claude)
+      timeout "$TIMEOUT" claude -p "$prompt" \
+        --allowedTools Read Grep Glob WebSearch WebFetch "mcp__hindsight-memory__*" --no-session-persistence < /dev/null > "$out" ;;
+    codex)
+      timeout "$TIMEOUT" codex exec "$prompt" -C "$REPO" -s read-only \
+        --ephemeral --skip-git-repo-check --color never -o "$out" > /dev/null ;;
+    *) echo "unknown model: $model" >&2; return 2 ;;
+  esac
+}
+
+cd "$REPO"
+IFS=',' read -ra list <<< "$MEMBERS"
+echo "council: asking ${list[*]} … (run dir: ${RUN#$REPO/})" >&2
+
+# COUNCIL_SERIAL=1 runs members one after the other, so only one model CLI is in memory at a
+# time; bin/council-bg sets it, since a background run can overlap a Signal reply or the nightly.
+declare -A pids
+for m in "${list[@]}"; do
+  ( ask "$m" "$PROMPT" "$RUN/$m.md" 2> "$RUN/$m.err" ) &
+  pids[$m]=$!
+  if [ "${COUNCIL_SERIAL:-0}" = 1 ]; then wait "${pids[$m]}" && pids[$m]=ok || pids[$m]=fail; fi
+done
+
+member_ok() { case "${pids[$1]}" in ok) return 0 ;; fail) return 1 ;; *) wait "${pids[$1]}" ;; esac; }
+ok=()
+for m in "${list[@]}"; do
+  if member_ok "$m" && [ -s "$RUN/$m.md" ]; then
+    ok+=("$m"); rm -f "$RUN/$m.err"
+  else
+    echo "council: $m failed (see ${RUN#$REPO/}/$m.err)" >&2
+  fi
+done
+
+if [ ${#ok[@]} -eq 0 ]; then echo "council: no member answered" >&2; exit 1; fi
+if [ ${#ok[@]} -eq 1 ]; then
+  echo "council: only ${ok[0]} answered; skipping synthesis" >&2
+  cp "$RUN/${ok[0]}.md" "$RUN/final.md"
+  printf '\n---\n*Council: only %s answered (no synthesis, no agreement analysis); run %s*\n' \
+    "${ok[0]}" "${RUN#$REPO/}" >> "$RUN/final.md"
+else
+
+# Anonymize members as "Answer A/B/…" so the synthesizer doesn't favour its own model.
+{
+  render "$REPO/prompts/synthesize.md"
+  printf '\n\n## Question\n\n%s\n' "$PROMPT"
+  letter=A
+  for m in "${ok[@]}"; do
+    printf '\n\n## Answer %s\n\n' "$letter"; cat "$RUN/$m.md"
+    echo "$letter=$m" >> "$RUN/key.txt"
+    letter=$(echo "$letter" | tr 'A-Y' 'B-Z')
+  done
+} > "$RUN/synth-prompt.md"
+
+echo "council: synthesizing with $SYNTH …" >&2
+ask "$SYNTH" "$(cat "$RUN/synth-prompt.md")" "$RUN/final.md"
+
+# De-anonymize for the reader: "| A |" -> "| A (claude) |", "Answer A" -> "Answer A (claude)".
+while IFS='=' read -r letter model; do
+  sed -i -E "s/\| $letter \|/| $letter ($model) |/g; s/\bAnswer $letter\b/Answer $letter ($model)/g" "$RUN/final.md"
+done < "$RUN/key.txt"
+printf '\n---\n*Council: members %s; synthesizer %s; run %s*\n' "${ok[*]}" "$SYNTH" "${RUN#$REPO/}" >> "$RUN/final.md"
+fi
+cat "$RUN/final.md"
+
+# open_pr: commit only the final answer to a new branch of the data repo (in a throwaway worktree,
+# so the checkout you're in is untouched) and open a PR there for review. Failures only warn.
+open_pr() {
+  local stamp base wt branch name file title confidence body
+  stamp="$(basename "$RUN" | cut -d- -f1-2)"           # YYYYMMDD-HHMMSS
+  branch="council/$stamp-$slug"
+  base="$(date +%Y-%m-%d)-$slug"
+  wt="$(mktemp -d)"
+  # Always clean up the worktree and local branch; once pushed, the branch lives on GitHub.
+  trap 'git -C "$DATA" worktree remove --force "$wt" 2>/dev/null; rm -rf "$wt";
+        git -C "$DATA" branch -q -D "$branch" 2>/dev/null' RETURN
+
+  timeout 30 git -C "$DATA" fetch -q origin main || { echo "fetch failed"; return 1; }
+  git -C "$DATA" worktree add -q -b "$branch" "$wt" origin/main || return 1
+
+  name="$base"
+  [ -e "$wt/archive/council/$name.md" ] && name="$base-${stamp#*-}"
+  file="archive/council/$name.md"
+  mkdir -p "$wt/archive/council"
+  {
+    printf '# Council: %s\n\n' "$(printf '%s' "$PROMPT" | head -n1 | cut -c1-100)"
+    printf '*%s*\n\n## Question\n\n%s\n\n' "$(date +%Y-%m-%d)" "$PROMPT"
+    # Demote the report's headings one level so the file has a single H1.
+    sed -E 's/^(#+) /#\1 /' "$RUN/final.md"
+  } > "$wt/$file"
+
+  title="council: $(printf '%s' "$PROMPT" | head -n1 | cut -c1-60)"
+  [ ${#ok[@]} -eq 1 ] && title="$title (only ${ok[0]} answered)"
+  confidence="$(grep -m1 -i -E '\*\*Confidence:?\*\*' "$RUN/final.md" | sed -E 's/^[0-9.[:space:]-]*//' || true)"
+
+  git -C "$wt" add "$file"
+  git -C "$wt" commit -q -m "$title" -m "Final council answer, run ${RUN#$REPO/}." \
+    -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" || return 1
+  timeout 60 git -C "$wt" push -q -u origin "$branch" || { echo "push failed"; return 1; }
+
+  body="$(printf 'Final answer of a council run, for review. Merge to archive it in `archive/` (not indexed into Hindsight or read by agents by default); close to discard.\n\n- **File:** `%s`\n- **Members:** %s\n- **Synthesizer:** %s\n%s\n\n### Question\n\n%s\n\nRaw member answers stay local in `%s/`.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' \
+    "$file" "${ok[*]}" "$([ ${#ok[@]} -gt 1 ] && echo "$SYNTH" || echo "none (single answer)")" \
+    "${confidence:+- $confidence}" "$PROMPT" "${RUN#$REPO/}")"
+  timeout 60 gh pr create \
+    --base main --head "$branch" --title "$title" --body "$body" || { echo "gh pr create failed"; return 1; }
+}
+
+if [ "$PR" = 1 ]; then
+  echo "council: opening PR …" >&2
+  if ! url="$(cd "$DATA" && open_pr 2>"$RUN/pr.err")"; then
+    echo "council: warning: PR not opened (${url:-see ${RUN#$REPO/}/pr.err}); answer is in ${RUN#$REPO/}/final.md" >&2
+  else
+    rm -f "$RUN/pr.err"; echo "council: PR $url" >&2
+  fi
+fi

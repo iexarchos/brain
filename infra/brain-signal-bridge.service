@@ -1,0 +1,15 @@
+[Unit]
+Description=brain Signal bridge: owner's Signal messages -> claude -p in ~/brain -> reply
+After=brain-signal.service hindsight.service
+Wants=brain-signal.service hindsight.service
+
+[Service]
+User=brain
+WorkingDirectory=/home/brain/brain
+EnvironmentFile=/home/brain/.config/brain/signal.env
+ExecStart=/home/brain/brain/bin/signal-bridge
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

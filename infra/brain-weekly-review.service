@@ -1,0 +1,12 @@
+[Unit]
+Description=brain weekly review: check models, memory design and efficiency; report as a GitHub issue
+After=hindsight.service network-online.target
+
+[Service]
+Type=oneshot
+User=brain
+WorkingDirectory=/home/brain/brain
+# Long-lived Claude token for headless runs (see infra/README.md §2); optional.
+EnvironmentFile=-/home/brain/.config/brain/claude.env
+ExecStart=/home/brain/brain/bin/weekly-review
+TimeoutStartSec=45min

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# init-data — set up the owner's private data checkout (data/) next to the engine.
+#
+#   init-data "Owner Name" [github-owner/repo]   new data repo from data.example/
+#   init-data --clone github-owner/repo          existing data repo (a new host)
+#
+# New: copies data.example/ to data/, fills in data/brain.env and data/AGENTS.md, makes data/ a
+# git repo and, given a repo name, creates it on GitHub as PRIVATE and pushes. Either way it also
+# enables the engine's leak-check hooks (core.hooksPath .githooks), so personal data listed in
+# data/denylist.txt can't be committed or pushed to the public engine repo.
+set -euo pipefail
+. "$(dirname "$0")/brain-env.sh"
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+[ $# -ge 1 ] || usage 1
+[ ! -e "$DATA" ] || { echo "init-data: $DATA already exists" >&2; exit 1; }
+
+git -C "$REPO" config core.hooksPath .githooks
+
+if [ "$1" = "--clone" ]; then
+  [ $# -eq 2 ] || usage 1
+  gh repo clone "$2" "$DATA"
+  echo "init-data: cloned $2 into $DATA"
+  exit 0
+fi
+
+name="$1"; slug="${2:-}"; bank="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//')"
+cp -r "$REPO/data.example" "$DATA"
+cat > "$DATA/brain.env" <<ENV
+# Settings for the brain engine's scripts (loaded by bin/brain-env.sh and bin/brainenv.py).
+OWNER_NAME=$name
+HINDSIGHT_BANK_ID=${bank:-brain}
+BRAIN_DATA_REPO=$slug
+ENV
+OWNER="$name" python3 - "$DATA" <<'PY'
+import os, pathlib, sys
+for p in pathlib.Path(sys.argv[1]).rglob("*"):
+    if p.is_file() and p.suffix in (".md", ".json", ".txt"):
+        t = p.read_text()
+        if "{{OWNER}}" in t:
+            p.write_text(t.replace("{{OWNER}}", os.environ["OWNER"]))
+PY
+git -C "$DATA" init -q -b main
+git -C "$DATA" add -A
+git -C "$DATA" commit -q -m "Initial data repo"
+if [ -n "$slug" ]; then
+  gh repo create "$slug" --private --source "$DATA" --push
+  gh repo edit "$slug" --delete-branch-on-merge >/dev/null
+fi
+cat <<MSG
+init-data: created $DATA for $name (Hindsight bank: ${bank:-brain}).
+Next: add your name, email and other identifying strings to data/denylist.txt, and review
+data/AGENTS.md (your personal instructions). Hindsight setup: infra/hindsight/README.md.
+MSG

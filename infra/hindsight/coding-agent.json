@@ -1,0 +1,11 @@
+{
+  "serverMode": "self-hosted",
+  "apiUrl": "http://127.0.0.1:8888",
+  "bankId": "brain",
+  "dynamicBankId": false,
+  "autoSeed": false,
+  "codebaseSurvey": false,
+  "autoInject": "recall",
+  "injectTimeoutMs": 15000,
+  "pageRefreshEveryTurns": 1000000000
+}
