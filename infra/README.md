@@ -97,7 +97,7 @@ SessionStart hook in both, so every session fast-forwards `main` from GitHub:
 ```
 
 Also set `"autoMemoryEnabled": false` in `~/.claude/settings.json`. That turns off Claude Code's
-own memory, so memory lives only in `knowledge/` and Hindsight, which Codex sees too.
+own memory, so memory lives only in `data/knowledge/` and Hindsight, which Codex sees too.
 
 In `~/.claude/settings.json` it goes in `hooks.SessionStart[0].hooks`, before the Hindsight
 entry; `~/.codex/hooks.json` has the same shape. These files live outside the repo because
